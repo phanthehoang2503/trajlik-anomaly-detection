@@ -74,6 +74,36 @@ class EvaluateTrajLikTest(unittest.TestCase):
                 feature_channels=272,
             )
 
+    def test_official_config_and_relocated_dataset_are_accepted(self):
+        import tempfile
+        from pathlib import Path
+        import yaml
+
+        config = runtime_config()
+        config["data"]["transform_type"] = "default"
+        config["data"]["data_root"] = "/kaggle/input/datasets/ipythonx/mvtec-ad"
+        config["evaluation"]["eval_step"] = 4
+        head_checkpoint = self._head_checkpoint(config)
+        head_checkpoint["cache_metadata"]["config_sha256"] = "original-cache-hash"
+        head_checkpoint["cache_metadata"]["transform_type"] = "default"
+
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            checkpoint = directory / "model.pth"
+            checkpoint.touch()
+            (directory / "config.yaml").write_text(
+                yaml.safe_dump(config),
+                encoding="utf-8",
+            )
+
+            with self.assertLogs("scripts.evaluate_trajlik", level="WARNING"):
+                validate_runtime_contract(
+                    config,
+                    checkpoint,
+                    head_checkpoint,
+                    feature_channels=272,
+                )
+
     def test_projected_cache_and_config_mismatch_are_rejected(self):
         import tempfile
         from pathlib import Path
