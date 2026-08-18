@@ -32,6 +32,14 @@ train/validation NLL, NLL per dimension, MSM, base NLL, flow log-determinant,
 learning rate, duration, and peak GPU memory. The complete epoch history and
 split indices are stored in the final checkpoint.
 
+The DCTE output remains the LayerNorm trajectory code specified by the proposal.
+While fitting ECTF, the implementation adds resampled normal-only Gaussian
+dequantization noise (default standard deviation `0.1`) to that code. This avoids
+an ill-posed full-dimensional likelihood on the nearly singular LayerNorm shell.
+MSM uses the original code, and evaluation, normal-tail calibration, frozen InvAD,
+and the three-NFE inference path remain deterministic and unchanged. Raw NLL
+values are comparable only when the dequantization standard deviation is fixed.
+
 ## Requirements
 
 - The packages in `requirements.txt`
@@ -53,7 +61,9 @@ python -m scripts.train_trajlik \
 
 Defaults are 50 maximum epochs, five-epoch patience, and a 90/5/5
 train/validation/calibration split. `lambda_msm=1` is only an initial candidate;
-main experiment values must be selected without anomaly labels.
+main experiment values must be selected without anomaly labels. The fixed
+`flow_dequantization_std=0.1` is recorded in every checkpoint; alternatives may
+only be selected using normal validation criteria.
 
 Evaluate the complete pipeline:
 

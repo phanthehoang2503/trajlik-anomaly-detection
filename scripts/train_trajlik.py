@@ -55,6 +55,15 @@ def parse_args():
     parser.add_argument("--dcte_heads", type=int, default=4)
     parser.add_argument("--flow_blocks", type=int, default=4)
     parser.add_argument("--flow_bins", type=int, default=8)
+    parser.add_argument(
+        "--flow_dequantization_std",
+        type=float,
+        default=0.1,
+        help=(
+            "Normal-only Gaussian noise applied to LayerNorm trajectory codes "
+            "while fitting ECTF; inference and calibration remain deterministic"
+        ),
+    )
     parser.add_argument("--lambda_msm", type=float, default=1.0)
     return parser.parse_args()
 
@@ -101,6 +110,11 @@ def build_head(input_dim, args):
         ectf=ectf,
         msm_loss=msm_loss,
         lambda_msm=args.lambda_msm,
+        flow_dequantization_std=getattr(
+            args,
+            "flow_dequantization_std",
+            0.0,
+        ),
     )
 
 
@@ -271,16 +285,22 @@ def load_trajlik_checkpoint(checkpoint_path, device="cpu"):
 
 
 def train(args):
+    if not hasattr(args, "flow_dequantization_std"):
+        # Programmatic callers created before this stabilization option should
+        # receive the new safe training default. Old saved checkpoints remain
+        # backward-compatible through build_head's zero-noise fallback.
+        args.flow_dequantization_std = 0.1
     if (
         args.epochs <= 0
         or args.batch_size <= 0
         or args.grad_clip <= 0
         or args.patience <= 0
         or args.min_delta < 0
+        or args.flow_dequantization_std < 0
     ):
         raise ValueError(
             "epochs, batch_size, grad_clip, and patience must be positive; "
-            "min_delta must be non-negative"
+            "min_delta and flow_dequantization_std must be non-negative"
         )
     seed_everything(args.seed)
     device = torch.device(args.device)
@@ -350,7 +370,8 @@ def train(args):
     logger.info(
         "Training TrajLik | device=%s | cache=%s | train=%d | validation=%d "
         "| calibration=%d "
-        "| categories=%d | channels=%d | lambda_msm=%.4g | trainable_params=%d",
+        "| categories=%d | channels=%d | lambda_msm=%.4g "
+        "| flow_dequant_std=%.4g | trainable_params=%d",
         device,
         args.cache_dir,
         len(training_subset),
@@ -359,6 +380,7 @@ def train(args):
         len(set(dataset.categories)),
         input_dim,
         args.lambda_msm,
+        args.flow_dequantization_std,
         trainable_parameters,
     )
 

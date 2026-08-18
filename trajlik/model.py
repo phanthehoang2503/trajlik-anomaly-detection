@@ -16,22 +16,38 @@ class TrajLikHead(nn.Module):
         ectf: EndpointConditionedTrajectoryFlow,
         msm_loss: MSMLoss,
         lambda_msm: float = 1.0,
+        flow_dequantization_std: float = 0.1,
     ):
         super().__init__()
         if dcte.trajectory_dim != ectf.trajectory_dim:
             raise ValueError("DCTE and ECTF trajectory dimensions must match")
+        if flow_dequantization_std < 0.0:
+            raise ValueError("flow_dequantization_std must be non-negative")
         self.dcte = dcte
         self.ectf = ectf
         self.msm_loss = msm_loss
         self.lambda_msm = lambda_msm
+        self.flow_dequantization_std = float(flow_dequantization_std)
 
-    def forward(self, module0_output, mask: bool | None = None) -> dict[str, Tensor]:
+    def forward(
+        self,
+        module0_output,
+        mask: bool | None = None,
+        *,
+        dequantize_flow: bool = False,
+    ) -> dict[str, Tensor]:
         if mask is None:
             mask = self.training
         trajectory_batch = build_trajectory_batch(module0_output)
         dcte_output = self.dcte(trajectory_batch, mask=mask)
+        flow_trajectory_codes = dcte_output["trajectory_codes"]
+        if dequantize_flow and self.flow_dequantization_std > 0.0:
+            flow_trajectory_codes = flow_trajectory_codes + (
+                torch.randn_like(flow_trajectory_codes)
+                * self.flow_dequantization_std
+            )
         flow_output = self.ectf(
-            dcte_output["trajectory_codes"],
+            flow_trajectory_codes,
             trajectory_batch["a_end_coarse"],
             trajectory_batch["z0"],
         )
@@ -39,10 +55,18 @@ class TrajLikHead(nn.Module):
             **dcte_output,
             **flow_output,
             "a_end_coarse": trajectory_batch["a_end_coarse"],
+            "flow_trajectory_codes": flow_trajectory_codes,
         }
 
     def training_loss(self, module0_output) -> dict[str, Tensor]:
-        output = self(module0_output, mask=True)
+        # Per-sample LayerNorm places DCTE codes on a nearly singular shell.
+        # Resampled normal-only noise gives ECTF a full-dimensional density to
+        # fit, preventing an unbounded Jacobian on the LayerNorm constraints.
+        output = self(
+            module0_output,
+            mask=True,
+            dequantize_flow=True,
+        )
         nll_loss = output["path_nll"].mean()
         msm_loss = self.msm_loss(
             output,

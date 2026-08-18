@@ -9,7 +9,7 @@ from trajlik.model import TrajLikAD, TrajLikHead
 from trajlik.normal_tail import EmpiricalTailCalibrator
 
 
-def build_head():
+def build_head(flow_dequantization_std=0.1):
     dcte = DCTE(
         input_dim=8,
         projection_dim=4,
@@ -38,7 +38,12 @@ def build_head():
         token_dim=8,
         trajectory_dim=4,
     )
-    return TrajLikHead(dcte, ectf, msm)
+    return TrajLikHead(
+        dcte,
+        ectf,
+        msm,
+        flow_dequantization_std=flow_dequantization_std,
+    )
 
 
 def module0_output(batch=2):
@@ -73,6 +78,56 @@ class TrajLikTest(unittest.TestCase):
         gradient = head.dcte.tokenizer.state_projection.weight.grad
         self.assertIsNotNone(gradient)
         self.assertTrue(torch.isfinite(gradient).all())
+
+    def test_dequantization_is_used_only_for_density_fitting(self):
+        head = build_head(flow_dequantization_std=0.1).eval()
+        inputs = module0_output()
+
+        inference_output = head(inputs, mask=False)
+        repeated_inference_output = head(inputs, mask=False)
+        training_output = head.training_loss(inputs)
+
+        self.assertTrue(
+            torch.equal(
+                inference_output["trajectory_codes"],
+                inference_output["flow_trajectory_codes"],
+            )
+        )
+        self.assertFalse(
+            torch.equal(
+                training_output["trajectory_codes"],
+                training_output["flow_trajectory_codes"],
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                inference_output["path_nll"],
+                repeated_inference_output["path_nll"],
+            )
+        )
+        noise = (
+            training_output["flow_trajectory_codes"]
+            - training_output["trajectory_codes"]
+        )
+        self.assertTrue(torch.isfinite(noise).all())
+        self.assertGreater(noise.std().item(), 0.05)
+        self.assertLess(noise.std().item(), 0.15)
+
+    def test_zero_dequantization_preserves_legacy_density_input(self):
+        head = build_head(flow_dequantization_std=0.0).train()
+
+        output = head.training_loss(module0_output())
+
+        self.assertTrue(
+            torch.equal(
+                output["trajectory_codes"],
+                output["flow_trajectory_codes"],
+            )
+        )
+
+    def test_negative_dequantization_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "must be non-negative"):
+            build_head(flow_dequantization_std=-0.1)
 
     def test_inference_runs_module0_once_and_returns_official_scores(self):
         module0 = CountingModule0()
