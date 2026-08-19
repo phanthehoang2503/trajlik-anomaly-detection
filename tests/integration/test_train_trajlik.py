@@ -122,7 +122,6 @@ class TrainTrajLikSmokeTest(unittest.TestCase):
                 dcte_heads=2,
                 flow_blocks=1,
                 flow_bins=4,
-                flow_dequantization_std=0.1,
                 lambda_msm=1.0,
             )
 
@@ -150,10 +149,6 @@ class TrainTrajLikSmokeTest(unittest.TestCase):
             self.assertIn("validation_nll", checkpoint["training_history"][0])
             self.assertIn("validation_msm", checkpoint["training_history"][0])
             self.assertIn("validation_log_det", checkpoint["training_history"][0])
-            self.assertEqual(
-                checkpoint["training_args"]["flow_dequantization_std"],
-                0.1,
-            )
             first_epoch = checkpoint["training_history"][0]
             self.assertAlmostEqual(
                 first_epoch["validation_nll"],
