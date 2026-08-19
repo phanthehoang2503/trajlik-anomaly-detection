@@ -45,6 +45,11 @@ class OrganizeCacheTest(unittest.TestCase):
                     {
                         "num_images": 2,
                         "num_steps": 3,
+                        "invad_checkpoint": {
+                            "filename": "model.pth",
+                            "size_bytes": 123,
+                            "sha256": "a" * 64,
+                        },
                         "output_channels": 4,
                         "storage_dtype": "float32",
                         "projection": "none",

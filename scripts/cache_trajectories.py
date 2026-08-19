@@ -23,6 +23,7 @@ for path in (project_root, baseline_root):
 from src.backbones import get_backbone, get_backbone_feature_shape
 from src.datasets import build_dataset
 from src.denoiser import get_denoiser
+from trajlik.cache_identity import checkpoint_identity
 from trajlik.cache_layout import sanitize_category
 from trajlik.trajectory_projector import TrajectoryProjector
 
@@ -235,6 +236,11 @@ def cache_trajectories(config: dict, args):
         args.use_ema_model,
         args.checkpoint_path,
     )
+    invad_checkpoint_identity = checkpoint_identity(checkpoint_path)
+    logger.info(
+        "Cache bound to InvAD checkpoint SHA-256: %s",
+        invad_checkpoint_identity["sha256"],
+    )
 
     autocast_enabled, autocast_dtype, autocast_dtype_name = resolve_autocast(
         device,
@@ -363,6 +369,7 @@ def cache_trajectories(config: dict, args):
         "storage_dtype": args.storage_dtype,
         "autocast_dtype": autocast_dtype_name,
         "checkpoint_path": str(checkpoint_path),
+        "invad_checkpoint": invad_checkpoint_identity,
         "max_images": args.max_images,
         "timestep_map": [
             int(timestep)

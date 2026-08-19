@@ -47,6 +47,10 @@ values are comparable only when the dequantization standard deviation is fixed.
   `cache_index.json`
 - A config matching both the InvAD and TrajLik checkpoints
 
+Cache metadata binds the trained head to the exact InvAD checkpoint SHA-256 and
+three-step `timestep_map`. Evaluation fails before loading data if either differs
+or is missing.
+
 ## Usage
 
 Run the following commands from the project root.

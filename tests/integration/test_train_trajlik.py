@@ -77,6 +77,12 @@ class TrainTrajLikSmokeTest(unittest.TestCase):
                 {
                     "num_images": 4,
                     "num_steps": 3,
+                    "timestep_map": [0, 499, 999],
+                    "invad_checkpoint": {
+                        "filename": "model.pth",
+                        "size_bytes": 123,
+                        "sha256": "a" * 64,
+                    },
                     "output_channels": 8,
                     "normal_only": True,
                     "projection": "none",

@@ -25,6 +25,11 @@ from src.datasets import build_dataset
 from src.denoiser import get_denoiser
 from scripts.cache_trajectories import load_checkpoint
 from scripts.train_trajlik import load_trajlik_checkpoint
+from trajlik.cache_identity import (
+    checkpoint_identity,
+    checkpoint_identity_errors,
+    normalized_timestep_map,
+)
 from trajlik.inversion_ad_module import InversionADModule
 from trajlik.model import TrajLikAD
 from trajlik.reproducibility import compare_checkpoint_config
@@ -59,6 +64,7 @@ def validate_runtime_contract(
     invad_checkpoint,
     head_checkpoint,
     feature_channels,
+    runtime_timestep_map=None,
 ):
     errors = []
     invad_checkpoint = Path(invad_checkpoint)
@@ -74,6 +80,53 @@ def validate_runtime_contract(
         )
 
     metadata = head_checkpoint.get("cache_metadata", {})
+    recorded_identity = metadata.get("invad_checkpoint")
+    if recorded_identity is None:
+        errors.append("TrajLik cache metadata is missing invad_checkpoint SHA-256")
+    else:
+        identity_errors = checkpoint_identity_errors(recorded_identity)
+        errors.extend(
+            "TrajLik cache " + identity_error
+            for identity_error in identity_errors
+        )
+        if not identity_errors:
+            try:
+                runtime_identity = checkpoint_identity(invad_checkpoint)
+            except OSError as error:
+                errors.append(f"Cannot hash InvAD checkpoint: {error}")
+            else:
+                if recorded_identity["sha256"].lower() != runtime_identity["sha256"]:
+                    errors.append(
+                        "InvAD checkpoint SHA-256 does not match the checkpoint "
+                        "used to create the TrajLik cache"
+                    )
+                if (
+                    int(recorded_identity["size_bytes"])
+                    != runtime_identity["size_bytes"]
+                ):
+                    errors.append(
+                        "InvAD checkpoint size does not match the checkpoint used "
+                        "to create the TrajLik cache"
+                    )
+
+    recorded_timestep_map = metadata.get("timestep_map")
+    if recorded_timestep_map is None:
+        errors.append("TrajLik cache metadata is missing timestep_map")
+    elif runtime_timestep_map is None:
+        errors.append("Evaluator did not provide a runtime timestep_map")
+    else:
+        try:
+            recorded_timestep_map = normalized_timestep_map(recorded_timestep_map)
+            runtime_timestep_map = normalized_timestep_map(runtime_timestep_map)
+        except (TypeError, ValueError) as error:
+            errors.append(f"Invalid timestep_map identity: {error}")
+        else:
+            if recorded_timestep_map != runtime_timestep_map:
+                errors.append(
+                    "InvAD timestep_map does not match the schedule used to create "
+                    "the TrajLik cache"
+                )
+
     expected_fingerprint = metadata.get("config_sha256")
     if expected_fingerprint and expected_fingerprint != config_fingerprint(config):
         logger.warning(
@@ -212,12 +265,6 @@ def evaluate(args):
         args.trajlik_checkpoint,
         device=device,
     )
-    validate_runtime_contract(
-        config,
-        args.invad_checkpoint,
-        head_checkpoint,
-        feature_shape[0],
-    )
 
     diffusion_config = copy.deepcopy(config["diffusion"])
     diffusion_config["num_sampling_steps"] = "3"
@@ -225,6 +272,16 @@ def evaluate(args):
         **diffusion_config,
         input_shape=feature_shape,
     ).to(device).eval()
+    runtime_timestep_map = [
+        int(timestep) for timestep in denoiser.sample_diffusion.timesteps_map
+    ]
+    validate_runtime_contract(
+        config,
+        args.invad_checkpoint,
+        head_checkpoint,
+        feature_shape[0],
+        runtime_timestep_map,
+    )
     load_checkpoint(
         denoiser,
         save_dir=None,
