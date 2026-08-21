@@ -3,8 +3,9 @@ diffusion:
   num_classes: 15
   target_channels: 3
   z_channels: 768
-  depth: 16
-  width: 2048
+  # Local smaller DiT variant; upstream does not publish an official Base YAML.
+  depth: 8
+  width: 1024
   num_sampling_steps: '100'
   ema_decay: 0.999
   learn_sigma: false
@@ -18,7 +19,7 @@ backbone:
       - 5
       - 9
       - 21
-    outstrides: 
+    outstrides:
       - 2
       - 4
       - 8
@@ -51,7 +52,7 @@ logging:
   log_interval: 10
   save_interval: 300
   save_images: false
-  save_dir: 'results/exp_dit_gigant_ad/all'
+  save_dir: 'results/exp_dit_base_ad/all'
 evaluation:
   eval_interval: 25
   eval_step: 3

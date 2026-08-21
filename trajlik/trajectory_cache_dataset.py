@@ -5,6 +5,11 @@ from pathlib import Path
 import torch
 from torch.utils.data import Dataset, WeightedRandomSampler
 
+from trajlik.cache_identity import (
+    checkpoint_identity_errors,
+    normalized_timestep_map,
+)
+
 
 class TrajectoryCacheDataset(Dataset):
     """Read a cache whose index explicitly proves normal-training provenance."""
@@ -23,6 +28,18 @@ class TrajectoryCacheDataset(Dataset):
             self.metadata = json.load(file)
         with (self.cache_dir / "cache_index.json").open(encoding="utf-8") as file:
             self.index = json.load(file)
+
+        identity_errors = checkpoint_identity_errors(
+            self.metadata.get("invad_checkpoint")
+        )
+        if identity_errors:
+            raise ValueError("Invalid cache identity: " + "; ".join(identity_errors))
+        try:
+            timestep_map = normalized_timestep_map(self.metadata["timestep_map"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError("Invalid cache timestep_map") from error
+        if len(timestep_map) != int(self.metadata["num_steps"]):
+            raise ValueError("Cache timestep_map length does not match num_steps")
 
         if self.metadata.get("normal_only") is not True:
             raise ValueError("Trajectory head training requires a normal-only cache")

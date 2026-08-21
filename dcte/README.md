@@ -16,7 +16,7 @@ The canonical `states`, `epsilons`, and `deltas` form is also accepted.
 
 ## Output
 
-`DCTE.forward()` returns `trajectory_codes` with shape
+`DCTE.forward()` returns terminal-LayerNorm `trajectory_codes` with shape
 `[B, H*W, trajectory_dim]` and the intermediate tensors required by MSM.
 
 ## Requirements
