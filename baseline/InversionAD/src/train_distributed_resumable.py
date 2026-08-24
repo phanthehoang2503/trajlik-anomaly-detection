@@ -39,26 +39,6 @@ except ImportError:
 logging.basicConfig(stream=sys.stdout, level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-METRIC_KEYS = (
-    "I-AUROC",
-    "I-AP",
-    "I-F1Max",
-    "P-AUROC",
-    "P-AP",
-    "P-F1Max",
-    "PRO",
-    "mAD",
-)
-
-
-def aggregate_metrics(all_results):
-    if not all_results:
-        raise ValueError("Cannot aggregate empty evaluation results")
-    return {
-        key: float(np.mean([metrics[key] for metrics in all_results.values()]))
-        for key in METRIC_KEYS
-    }
-
 
 def _init_wandb(config, rank):
     if rank != 0:
@@ -329,8 +309,10 @@ def main(config, *, resume=None, init_weights=None):
 
         if (epoch + 1) % config["evaluation"]["eval_interval"] == 0:
             all_results = {}
+            categories = [dataset.category for dataset in anom_dataset.datasets]
             for anom_loader, normal_loader in zip(anom_loaders, normal_loaders):
-                metrics = evaluate.evaluate_dist(
+                logger.info("Evaluating on %s dataset", anom_loader.dataset.category)
+                metrics_dict = evaluate.evaluate_dist(
                     model,
                     feature_extractor,
                     anom_loader,
@@ -344,32 +326,57 @@ def main(config, *, resume=None, init_weights=None):
                     rank=rank,
                 )
                 if rank == 0:
-                    all_results.update(metrics)
+                    all_results.update(metrics_dict)
                 evaluate.distributed_barrier()
 
             if rank == 0:
-                avg_results = aggregate_metrics(all_results)
+                avg_results = {}
+                keys = [
+                    "I-AUROC",
+                    "I-AP",
+                    "I-F1Max",
+                    "P-AUROC",
+                    "P-AP",
+                    "P-F1Max",
+                    "PRO",
+                    "mAD",
+                ]
+                for key in keys:
+                    avg_results[key] = np.mean(
+                        [all_results[category][key] for category in all_results]
+                    )
                 logger.info("Average results: %s", avg_results)
-                current_metric = avg_results["mAD"]
+                current_auc = avg_results["I-AUROC"]
+
+                current_metric = float(avg_results["mAD"])
                 if best_metric is None or current_metric > best_metric:
                     best_metric = current_metric
                 if use_wandb:
-                    for category, category_results in all_results.items():
-                        wandb.log(
-                            {
-                                **{
-                                    f"{category}/{key}": category_results[key]
-                                    for key in METRIC_KEYS
-                                },
-                                "global_step": global_step,
-                            }
-                        )
-                    wandb.log(
-                        {
-                            **{key: avg_results[key] for key in METRIC_KEYS},
-                            "global_step": global_step,
-                        }
-                    )
+                    for category in categories:
+                        wandb.log({
+                            f"{category}/I-AUROC": all_results[category]["I-AUROC"],
+                            f"{category}/I-AP": all_results[category]["I-AP"],
+                            f"{category}/I-F1Max": all_results[category]["I-F1Max"],
+                            f"{category}/P-AUROC": all_results[category]["P-AUROC"],
+                            f"{category}/P-AP": all_results[category]["P-AP"],
+                            f"{category}/P-F1Max": all_results[category]["P-F1Max"],
+                            f"{category}/PRO": all_results[category]["PRO"],
+                            f"{category}/mAD": all_results[category]["mAD"],
+                        })
+
+                    wandb.log({
+                        "I-AUROC": current_auc,
+                        "I-AP": avg_results["I-AP"],
+                        "I-F1Max": avg_results["I-F1Max"],
+                        "P-AUROC": avg_results["P-AUROC"],
+                        "P-AP": avg_results["P-AP"],
+                        "P-F1Max": avg_results["P-F1Max"],
+                        "PRO": avg_results["PRO"],
+                        "mAD": avg_results["mAD"],
+                    })
+                logger.info("AUC: %s at epoch %s", current_auc, epoch)
+
+            evaluate.distributed_barrier()
             best_metric_container = [best_metric]
             dist.broadcast_object_list(best_metric_container, src=0)
             best_metric = best_metric_container[0]

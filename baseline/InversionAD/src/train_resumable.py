@@ -228,7 +228,7 @@ def main(config, *, resume=None, init_weights=None):
 
         try:
             if (epoch + 1) % config["evaluation"]["eval_interval"] == 0:
-                metrics = evaluate_inv(
+                metrics_dict = evaluate_inv(
                     model,
                     feature_extractor,
                     anom_loader,
@@ -239,14 +239,14 @@ def main(config, *, resume=None, init_weights=None):
                     config["evaluation"]["eval_step"],
                     device,
                 )
-                current_metric = float(
-                    metrics[config["data"]["category"]]["mAD"]
-                )
+                current_mad = metrics_dict[config["data"]["category"]]["mAD"]
+                if use_wandb:
+                    wandb.log({"mAD": current_mad})
+                print(f"mAD: {current_mad} at epoch {epoch}")
+
+                current_metric = float(current_mad)
                 if best_metric is None or current_metric > best_metric:
                     best_metric = current_metric
-                print(f"mAD: {current_metric} at epoch {epoch + 1}")
-                if use_wandb:
-                    wandb.log({"mAD": current_metric, "global_step": global_step})
         finally:
             save_training_checkpoint(
                 checkpoint_path,

@@ -1,24 +1,53 @@
 import unittest
+from pathlib import Path
 
-from src.train_distributed_resumable import METRIC_KEYS, aggregate_metrics
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
-class DistributedMetricAggregationTest(unittest.TestCase):
-    def test_aggregates_every_metric_logged_by_regular_training(self):
-        first = {key: float(index) for index, key in enumerate(METRIC_KEYS)}
-        second = {
-            key: float(index + 2) for index, key in enumerate(METRIC_KEYS)
-        }
+def read_source(name):
+    return (ROOT / "src" / name).read_text(encoding="utf-8")
 
-        averages = aggregate_metrics({"first": first, "second": second})
 
-        self.assertEqual(set(averages), set(METRIC_KEYS))
-        for index, key in enumerate(METRIC_KEYS):
-            self.assertEqual(averages[key], float(index + 1))
+class ResumableMetricLoggingParityTest(unittest.TestCase):
+    def test_single_gpu_eval_logging_matches_regular_training(self):
+        regular = read_source("train.py")
+        resumable = read_source("train_resumable.py")
+        expected_markers = (
+            'metrics_dict = evaluate_inv(',
+            'wandb.log({"mAD": current_mad})',
+            'print(f"mAD: {current_mad} at epoch {epoch}")',
+        )
+        for marker in expected_markers:
+            self.assertIn(marker, regular)
+            self.assertIn(marker, resumable)
 
-    def test_rejects_empty_results(self):
-        with self.assertRaisesRegex(ValueError, "empty"):
-            aggregate_metrics({})
+    def test_distributed_eval_logging_matches_regular_training(self):
+        regular = read_source("train_distributed.py")
+        resumable = read_source("train_distributed_resumable.py")
+        expected_markers = (
+            "Evaluating on",
+            "Average results:",
+            'current_auc = avg_results["I-AUROC"]',
+            "AUC:",
+            '"I-AUROC"',
+            '"I-AP"',
+            '"I-F1Max"',
+            '"P-AUROC"',
+            '"P-AP"',
+            '"P-F1Max"',
+            '"PRO"',
+            '"mAD"',
+        )
+        for marker in expected_markers:
+            self.assertIn(marker, regular)
+            self.assertIn(marker, resumable)
+
+        eval_logging = resumable[
+            resumable.index('if (epoch + 1) % config["evaluation"]'):
+            resumable.index("best_metric_container")
+        ]
+        self.assertNotIn('"global_step"', eval_logging)
 
 
 if __name__ == "__main__":
