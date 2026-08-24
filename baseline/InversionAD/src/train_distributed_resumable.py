@@ -1,7 +1,6 @@
 import copy
 import logging
 import os
-import random
 import sys
 import time
 from pathlib import Path
@@ -43,25 +42,30 @@ logger = logging.getLogger(__name__)
 def _init_wandb(config, rank):
     if rank != 0:
         return False
-    if load_dotenv is not None:
-        load_dotenv()
-    if wandb is None or os.getenv("WANDB_API_KEY") is None:
+    use_wandb = False
+    try:
+        if load_dotenv is not None:
+            load_dotenv()
+        use_wandb = wandb is not None and os.getenv("WANDB_API_KEY") is not None
+        if use_wandb:
+            wandb.login(key=os.getenv("WANDB_API_KEY"))
+    except Exception:
+        use_wandb = False
+    if not use_wandb:
         return False
 
     project = os.environ.get("WANDB_PROJECT")
     entity = os.environ.get("WANDB_ENTITY")
     if project is None or entity is None:
         raise ValueError("WANDB_PROJECT and WANDB_ENTITY must be set when W&B is enabled")
-    wandb.login(key=os.environ["WANDB_API_KEY"])
     wandb.init(project=project, entity=entity, config=config)
     return True
 
 
 def _seed_everything(seed):
-    random.seed(seed)
-    np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    torch.cuda.manual_seed(seed)
+    np.random.seed(seed)
 
 
 def _save_distributed_checkpoint(
@@ -100,6 +104,11 @@ def _save_distributed_checkpoint(
 
 def main(config, *, resume=None, init_weights=None):
     world_size, rank = init_distributed()
+    logger.info(
+        "Initalized distributed training with world size %s and rank %s",
+        world_size,
+        rank,
+    )
     if not dist.is_available() or not dist.is_initialized():
         raise RuntimeError("Distributed process group is not initialized")
     if rank != 0:
@@ -122,8 +131,6 @@ def main(config, *, resume=None, init_weights=None):
     train_sampler = torch.utils.data.distributed.DistributedSampler(
         train_dataset, num_replicas=world_size, rank=rank
     )
-    loader_generator = torch.Generator()
-    loader_generator.manual_seed(config["meta"]["seed"] + rank)
     anom_samplers = [
         DistributedEvalSampler(dataset, world_size, rank)
         for dataset in anom_dataset.datasets
@@ -136,11 +143,10 @@ def main(config, *, resume=None, init_weights=None):
         train_dataset,
         sampler=train_sampler,
         batch_size=batch_size,
-        pin_memory=config["data"].get("pin_memory", True),
-        num_workers=config["data"].get("num_workers", 4),
-        persistent_workers=config["data"].get("num_workers", 4) > 0,
+        pin_memory=True,
+        num_workers=4,
+        persistent_workers=True,
         drop_last=True,
-        generator=loader_generator,
     )
     eval_batch_size = max(1, batch_size // world_size)
     anom_loaders = [
@@ -167,6 +173,7 @@ def main(config, *, resume=None, init_weights=None):
     diff_in_sh = get_backbone_feature_shape(
         model_type=config["backbone"]["model_type"]
     )
+    logger.info("Using input shape %s for the diffusion model", diff_in_sh)
     model: Denoiser = get_denoiser(**config["diffusion"], input_shape=diff_in_sh)
     model_ema = copy.deepcopy(model)
     model.to(device)
@@ -184,7 +191,12 @@ def main(config, *, resume=None, init_weights=None):
     for parameter in model_ema.parameters():
         parameter.requires_grad = False
 
-    feature_extractor = get_backbone(**config["backbone"])
+    backbone_kwargs = config["backbone"]
+    logger.info(
+        "Using feature space reconstruction with %s backbone",
+        backbone_kwargs["model_type"],
+    )
+    feature_extractor = get_backbone(**backbone_kwargs)
     feature_extractor.to(device).eval()
     optimizer = get_optimizer([model], **config["optimizer"])
     scheduler = None
@@ -232,13 +244,14 @@ def main(config, *, resume=None, init_weights=None):
     if rank == 0:
         save_dir.mkdir(parents=True, exist_ok=True)
         with open(save_dir / "config.yaml", "w", encoding="utf-8") as file:
-            yaml.safe_dump(config, file)
+            yaml.dump(config, file)
+        logger.info("Config is saved at %s", save_dir / "config.yaml")
     dist.barrier()
 
+    model.train()
     logger.info("Steps per epoch: %s", len(train_loader))
     ema_decay = config["diffusion"]["ema_decay"]
     for epoch in range(start_epoch, num_epochs):
-        model.train()
         train_sampler.set_epoch(epoch)
         for iteration, data in enumerate(train_loader):
             started_at = time.time()
@@ -269,15 +282,15 @@ def main(config, *, resume=None, init_weights=None):
                     ema_parameter.mul_(ema_decay).add_(
                         model_parameter, alpha=1.0 - ema_decay
                     )
+            ema_updated_at = time.time()
 
             global_step += 1
             if iteration % config["logging"]["log_interval"] == 0 and rank == 0:
                 learning_rate = optimizer.param_groups[0]["lr"]
                 logger.info(
-                    "Epoch %s, Iter %s, Step %s, Loss %.4f, LR %.6f",
+                    "Epoch %s, Iter %s, Loss %.4f, LR %.6f",
                     epoch,
                     iteration,
-                    global_step,
                     loss.item(),
                     learning_rate,
                 )
@@ -286,12 +299,21 @@ def main(config, *, resume=None, init_weights=None):
                         {
                             "Loss": loss.item(),
                             "LR": learning_rate,
-                            "global_step": global_step,
                             "Time/Data [ms]": (loaded_at - started_at) * 1000,
                             "Time/Forward [ms]": (forwarded_at - loaded_at) * 1000,
                             "Time/Backward [ms]": (optimized_at - forwarded_at) * 1000,
+                            "Time/Total [ms]": (ema_updated_at - started_at) * 1000,
                         }
                     )
+
+        if (epoch + 1) % config["logging"]["save_interval"] == 0 and rank == 0:
+            atomic_torch_save(
+                model.state_dict(), save_dir / f"model_latest_{epoch}.pth"
+            )
+            atomic_torch_save(
+                model_ema.state_dict(), save_dir / "model_ema_latest.pth"
+            )
+            logger.info("Model is saved at %s", save_dir)
 
         _save_distributed_checkpoint(
             checkpoint_path,
@@ -394,10 +416,11 @@ def main(config, *, resume=None, init_weights=None):
                 rank=rank,
             )
 
+    logger.info("Training is done!")
     if rank == 0:
-        atomic_torch_save(model.module.state_dict(), save_dir / "model_latest.pth")
+        atomic_torch_save(model.state_dict(), save_dir / "model_latest.pth")
         atomic_torch_save(
-            model_ema.module.state_dict(), save_dir / "model_ema_latest.pth"
+            model_ema.state_dict(), save_dir / "model_ema_latest.pth"
         )
-        logger.info("Training is done. Evaluation weights are saved at %s", save_dir)
+        logger.info("Model is saved at %s", save_dir)
     dist.barrier()

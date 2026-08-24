@@ -1,7 +1,6 @@
 import argparse
 import copy
 import os
-import random
 from pathlib import Path
 from pprint import pprint
 
@@ -58,9 +57,16 @@ def parse_args():
 
 
 def _init_wandb(config):
-    if load_dotenv is not None:
-        load_dotenv()
-    if wandb is None or os.getenv("WANDB_API_KEY") is None:
+    use_wandb = False
+    try:
+        if load_dotenv is not None:
+            load_dotenv()
+        use_wandb = wandb is not None and os.getenv("WANDB_API_KEY") is not None
+        if use_wandb:
+            wandb.login(key=os.getenv("WANDB_API_KEY"))
+    except Exception:
+        use_wandb = False
+    if not use_wandb:
         return False
 
     project = os.environ.get("WANDB_PROJECT")
@@ -68,17 +74,14 @@ def _init_wandb(config):
     if project is None or entity is None:
         raise ValueError("WANDB_PROJECT and WANDB_ENTITY must be set when W&B is enabled")
 
-    wandb.login(key=os.environ["WANDB_API_KEY"])
     wandb.init(project=project, entity=entity, config=config)
     return True
 
 
 def _seed_everything(seed):
-    random.seed(seed)
-    np.random.seed(seed)
     torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+    torch.cuda.manual_seed(seed)
+    np.random.seed(seed)
 
 
 def main(config, *, resume=None, init_weights=None):
@@ -175,15 +178,16 @@ def main(config, *, resume=None, init_weights=None):
     save_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = save_dir / "training_latest.pth"
     with open(save_dir / "config.yaml", "w", encoding="utf-8") as file:
-        yaml.safe_dump(config, file)
+        yaml.dump(config, file)
+    print(f"Config is saved at {save_dir / 'config.yaml'}")
 
     num_params = sum(parameter.numel() for parameter in model.parameters())
     print(f"Number of parameters: {num_params / 1e6:.2f}M")
+    model.train()
     print(f"Steps per epoch: {len(train_loader)}")
 
     ema_decay = config["diffusion"]["ema_decay"]
     for epoch in range(start_epoch, num_epochs):
-        model.train()
         for iteration, data in enumerate(train_loader):
             images = data["samples"].to(device)
             labels = data["clslabels"].to(device)
@@ -212,19 +216,17 @@ def main(config, *, resume=None, init_weights=None):
 
             global_step += 1
             if iteration % config["logging"]["log_interval"] == 0:
-                learning_rate = optimizer.param_groups[0]["lr"]
-                print(
-                    f"Epoch {epoch}, Iter {iteration}, Step {global_step}, "
-                    f"Loss {loss.item()}, LR {learning_rate}"
-                )
+                print(f"Epoch {epoch}, Iter {iteration}, Loss {loss.item()}")
                 if use_wandb:
-                    wandb.log(
-                        {
-                            "Loss": loss.item(),
-                            "LR": learning_rate,
-                            "global_step": global_step,
-                        }
-                    )
+                    learning_rate = optimizer.param_groups[0]["lr"]
+                    wandb.log({"Loss": loss.item(), "LR": learning_rate})
+
+        if (epoch + 1) % config["logging"]["save_interval"] == 0:
+            atomic_torch_save(model.state_dict(), save_dir / "model_latest.pth")
+            atomic_torch_save(
+                model_ema.state_dict(), save_dir / "model_ema_latest.pth"
+            )
+            print(f"Model is saved at {save_dir}")
 
         try:
             if (epoch + 1) % config["evaluation"]["eval_interval"] == 0:
@@ -261,9 +263,10 @@ def main(config, *, resume=None, init_weights=None):
             )
             print(f"Training checkpoint saved at {checkpoint_path}")
 
+    print("Training is done!")
     atomic_torch_save(model.state_dict(), save_dir / "model_latest.pth")
     atomic_torch_save(model_ema.state_dict(), save_dir / "model_ema_latest.pth")
-    print(f"Training is done. Evaluation weights are saved at {save_dir}")
+    print(f"Model is saved at {save_dir}")
 
 
 if __name__ == "__main__":
