@@ -39,6 +39,26 @@ except ImportError:
 logging.basicConfig(stream=sys.stdout, level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+METRIC_KEYS = (
+    "I-AUROC",
+    "I-AP",
+    "I-F1Max",
+    "P-AUROC",
+    "P-AP",
+    "P-F1Max",
+    "PRO",
+    "mAD",
+)
+
+
+def aggregate_metrics(all_results):
+    if not all_results:
+        raise ValueError("Cannot aggregate empty evaluation results")
+    return {
+        key: float(np.mean([metrics[key] for metrics in all_results.values()]))
+        for key in METRIC_KEYS
+    }
+
 
 def _init_wandb(config, rank):
     if rank != 0:
@@ -328,15 +348,27 @@ def main(config, *, resume=None, init_weights=None):
                 evaluate.distributed_barrier()
 
             if rank == 0:
-                current_metric = float(
-                    np.mean([result["mAD"] for result in all_results.values()])
-                )
+                avg_results = aggregate_metrics(all_results)
+                logger.info("Average results: %s", avg_results)
+                current_metric = avg_results["mAD"]
                 if best_metric is None or current_metric > best_metric:
                     best_metric = current_metric
-                logger.info("Average mAD: %s at epoch %s", current_metric, epoch + 1)
                 if use_wandb:
+                    for category, category_results in all_results.items():
+                        wandb.log(
+                            {
+                                **{
+                                    f"{category}/{key}": category_results[key]
+                                    for key in METRIC_KEYS
+                                },
+                                "global_step": global_step,
+                            }
+                        )
                     wandb.log(
-                        {"mAD": current_metric, "global_step": global_step}
+                        {
+                            **{key: avg_results[key] for key in METRIC_KEYS},
+                            "global_step": global_step,
+                        }
                     )
             best_metric_container = [best_metric]
             dist.broadcast_object_list(best_metric_container, src=0)
