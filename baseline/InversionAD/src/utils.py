@@ -108,7 +108,7 @@ class CosineAnnealingScheduler:
         return self.last_lr
 
 class WarmupCosineAnnealingScheduler:
-    def __init__(self, optimizer, warmup_steps: int, t_total: int, init_lr: float, peak_lr: float):
+    def __init__(self, optimizer, warmup_steps: int, t_total: int, init_lr: float, peak_lr: float, final_lr: float):
         """
         Args:
             optimizer (Optimizer): The optimizer to update.
@@ -116,13 +116,14 @@ class WarmupCosineAnnealingScheduler:
             t_total (int): Total number of steps for the schedule.
             init_lr (float): Initial learning rate.
             peak_lr (float): Peak learning rate after warmup.
+            final_lr (float): Final learning rate after cosine decay.
         """
         self.optimizer = optimizer
         self.warmup_steps = warmup_steps
         self.t_total = t_total
         self.init_lr = init_lr
         self.peak_lr = peak_lr
-        self.min_lr = 1e-6
+        self.min_lr = final_lr
         self.step_num = 0
         
         # Initialize the optimizer's learning rate.
@@ -241,17 +242,7 @@ def get_optimizer(
     
     return optimizer
 
-def get_lr_scheduler(
-    optimizer: torch.optim.Optimizer,
-    *,
-    scheduler_type: str,
-    init_lr: float,
-    peak_lr: float,
-    warmup_epochs: int,
-    num_epochs: int,
-    iter_per_epoch: int,
-    **kwargs: Any,
-):
+def get_lr_scheduler(optimizer: torch.optim.Optimizer, *, scheduler_type: str, init_lr: float, peak_lr: float, warmup_epochs: int, num_epochs: int, iter_per_epoch: int, **kwargs: Any,):
     """Get learning rate scheduler.
     Args:
         optimizer (torch.optim.Optimizer): Optimizer
@@ -277,6 +268,7 @@ def get_lr_scheduler(
             t_total=num_epochs * iter_per_epoch,
             init_lr=init_lr,
             peak_lr=peak_lr,
+            final_lr=kwargs.get("final_lr", 1e-6),
         )
     elif scheduler_type == "const":
         return ConstScheduler(
