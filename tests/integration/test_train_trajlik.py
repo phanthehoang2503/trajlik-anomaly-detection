@@ -77,6 +77,12 @@ class TrainTrajLikSmokeTest(unittest.TestCase):
                 {
                     "num_images": 4,
                     "num_steps": 3,
+                    "timestep_map": [0, 499, 999],
+                    "invad_checkpoint": {
+                        "filename": "model.pth",
+                        "size_bytes": 123,
+                        "sha256": "a" * 64,
+                    },
                     "output_channels": 8,
                     "normal_only": True,
                     "projection": "none",
@@ -116,7 +122,6 @@ class TrainTrajLikSmokeTest(unittest.TestCase):
                 dcte_heads=2,
                 flow_blocks=1,
                 flow_bins=4,
-                flow_dequantization_std=0.1,
                 lambda_msm=1.0,
             )
 
@@ -144,10 +149,6 @@ class TrainTrajLikSmokeTest(unittest.TestCase):
             self.assertIn("validation_nll", checkpoint["training_history"][0])
             self.assertIn("validation_msm", checkpoint["training_history"][0])
             self.assertIn("validation_log_det", checkpoint["training_history"][0])
-            self.assertEqual(
-                checkpoint["training_args"]["flow_dequantization_std"],
-                0.1,
-            )
             first_epoch = checkpoint["training_history"][0]
             self.assertAlmostEqual(
                 first_epoch["validation_nll"],

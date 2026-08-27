@@ -2,8 +2,9 @@
 
 ## Description
 
-ECTF is a conditional normalizing flow that assigns a likelihood to each DCTE
-trajectory code using the InvAD endpoint energy and initial feature map.
+ECTF is a conditional normalizing flow that assigns a likelihood directly to
+each terminal-LayerNorm DCTE trajectory code using the InvAD endpoint energy and
+initial feature map.
 
 ## Input
 

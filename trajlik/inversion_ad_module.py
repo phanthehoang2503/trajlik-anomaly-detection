@@ -11,11 +11,13 @@ class InversionADModule(nn.Module):
         feature_extractor: nn.Module,
         eval_denoiser: nn.Module,
         autocast_dtype: torch.dtype | None = None,
+        autocast_enabled: bool | None = None,
     ):
         super().__init__()
         self.feature_extractor = feature_extractor
         self.eval_denoiser = eval_denoiser
         self.autocast_dtype = autocast_dtype
+        self.autocast_enabled = autocast_enabled
 
     @torch.no_grad()
     def forward(
@@ -33,8 +35,11 @@ class InversionADModule(nn.Module):
             device=z_0.device,
         )
 
+        autocast_enabled = self.autocast_enabled
+        if autocast_enabled is None:
+            autocast_enabled = images.is_cuda
         autocast_dtype = self.autocast_dtype
-        if autocast_dtype is None and images.is_cuda:
+        if autocast_dtype is None and autocast_enabled:
             autocast_dtype = (
                 torch.bfloat16
                 if torch.cuda.is_bf16_supported()
@@ -44,7 +49,7 @@ class InversionADModule(nn.Module):
         with torch.amp.autocast(
             device_type=images.device.type,
             dtype=autocast_dtype or torch.float32,
-            enabled=images.is_cuda,
+            enabled=autocast_enabled,
         ):
             final_latent, z_seq, eps_seq, delta_z_seq = (
                 self.eval_denoiser.ddim_reverse_sample(
@@ -69,6 +74,7 @@ class InversionADModule(nn.Module):
         ).squeeze(1)
 
         return {
+            "final_latent": final_latent,
             "z_0": z_0,
             "z_seq": z_seq,
             "eps_seq": eps_seq,

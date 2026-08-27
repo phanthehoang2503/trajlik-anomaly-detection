@@ -29,17 +29,18 @@ python -m scripts.cache_trajectories \
     --force
 ```
 
-For a full run, remove `--max_images` and change `--cache_dir`. To use a
-To select an EMA checkpoint from a training directory instead, replace
-`--checkpoint_path` with:
+For a full run, remove `--max_images` and change `--cache_dir`. To select an EMA
+checkpoint from a training directory instead, replace `--checkpoint_path` with:
 
 ```bash
 --save_dir /path/to/training/results --use_ema_model
 ```
 
-The config architecture must match the checkpoint architecture.
-The metadata records the preprocessing mode and a SHA-256 fingerprint of the
-complete config so a cache cannot silently lose its provenance.
+The config architecture must match the checkpoint architecture. Cache metadata
+records the preprocessing mode, a SHA-256 fingerprint of the complete config,
+the exact InvAD checkpoint SHA-256 and size, and the ordered diffusion
+`timestep_map`. Evaluation rejects a different checkpoint or schedule even when
+the replacement has the same architecture and filename.
 
 ## Output
 
@@ -76,6 +77,9 @@ This preserves the official InvAD endpoint score when projection caching is on.
 python tests/cache_trajectories_check.py \
     --cache_dir /kaggle/working/cache_val
 ```
+
+Evaluation rejects metadata that is missing the checkpoint identity or
+`timestep_map`, as well as any recorded mismatch.
 
 Use `--force` only when the existing cache may be overwritten.
 

@@ -7,6 +7,7 @@ from pathlib import Path
 import torch
 
 
+
 SCRIPT_PATH = Path(__file__).parents[1] / "cache_trajectories_check.py"
 SPEC = importlib.util.spec_from_file_location("cache_check", SCRIPT_PATH)
 CACHE_CHECK = importlib.util.module_from_spec(SPEC)
@@ -23,6 +24,11 @@ class CacheValidationTest(unittest.TestCase):
             "projection": "none",
             "normal_only": True,
             "timestep_map": [0, 1, 2],
+            "invad_checkpoint": {
+                "filename": "model.pth",
+                "size_bytes": 123,
+                "sha256": "a" * 64,
+            },
         }
         (root / "cache_meta.json").write_text(
             json.dumps(metadata),
@@ -69,6 +75,18 @@ class CacheValidationTest(unittest.TestCase):
             self._write_cache(root, is_normal=False)
 
             with self.assertRaisesRegex(AssertionError, "marked normal"):
+                CACHE_CHECK.validate_cache(root)
+
+    def test_checkpoint_identity_is_required(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_cache(root)
+            metadata_path = root / "cache_meta.json"
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            metadata.pop("invad_checkpoint")
+            metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+            with self.assertRaisesRegex(AssertionError, "invad_checkpoint"):
                 CACHE_CHECK.validate_cache(root)
 
 

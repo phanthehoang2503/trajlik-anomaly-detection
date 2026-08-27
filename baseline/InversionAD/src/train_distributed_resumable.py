@@ -1,0 +1,426 @@
+import copy
+import logging
+import os
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.distributed as dist
+import yaml
+
+import src.evaluate as evaluate
+from src.backbones import get_backbone, get_backbone_feature_shape
+from src.checkpointing import (
+    atomic_torch_save,
+    capture_rng_state,
+    load_initial_weights,
+    load_training_checkpoint,
+    save_training_checkpoint,
+)
+from src.datasets import build_dataset
+from src.denoiser import Denoiser, get_denoiser
+from src.train_distributed import DistributedEvalSampler
+from src.utils import get_lr_scheduler, get_optimizer, init_distributed
+
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = None
+
+
+logging.basicConfig(stream=sys.stdout, level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+def _init_wandb(config, rank):
+    if rank != 0:
+        return False
+    use_wandb = False
+    try:
+        if load_dotenv is not None:
+            load_dotenv()
+        use_wandb = wandb is not None and os.getenv("WANDB_API_KEY") is not None
+        if use_wandb:
+            wandb.login(key=os.getenv("WANDB_API_KEY"))
+    except Exception:
+        use_wandb = False
+    if not use_wandb:
+        return False
+
+    project = os.environ.get("WANDB_PROJECT")
+    entity = os.environ.get("WANDB_ENTITY")
+    if project is None or entity is None:
+        raise ValueError("WANDB_PROJECT and WANDB_ENTITY must be set when W&B is enabled")
+    wandb.init(project=project, entity=entity, config=config)
+    return True
+
+
+def _seed_everything(seed):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    np.random.seed(seed)
+
+
+def _save_distributed_checkpoint(
+    path,
+    *,
+    model,
+    model_ema,
+    optimizer,
+    scheduler,
+    completed_epoch,
+    global_step,
+    best_metric,
+    config,
+    world_size,
+    rank,
+):
+    local_rng = capture_rng_state()
+    rng_states = [None] * world_size if rank == 0 else None
+    dist.gather_object(local_rng, rng_states, dst=0)
+    if rank == 0:
+        save_training_checkpoint(
+            path,
+            model=model,
+            model_ema=model_ema,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            completed_epoch=completed_epoch,
+            global_step=global_step,
+            best_metric=best_metric,
+            config=config,
+            rng_states=rng_states,
+        )
+        logger.info("Training checkpoint saved at %s", path)
+    dist.barrier()
+
+
+def main(config, *, resume=None, init_weights=None):
+    world_size, rank = init_distributed()
+    logger.info(
+        "Initalized distributed training with world size %s and rank %s",
+        world_size,
+        rank,
+    )
+    if not dist.is_available() or not dist.is_initialized():
+        raise RuntimeError("Distributed process group is not initialized")
+    if rank != 0:
+        logger.setLevel(logging.ERROR)
+
+    use_wandb = _init_wandb(config, rank)
+    _seed_everything(config["meta"]["seed"] + rank)
+    device = torch.device("cuda:0")
+    batch_size = config["data"]["batch_size"]
+
+    dataset_config = copy.deepcopy(config["data"])
+    train_config = copy.deepcopy(config["data"])
+    train_config.update(train=True, normal_only=True, anom_only=False)
+    train_dataset = build_dataset(**train_config)
+    dataset_config.update(train=False, anom_only=True)
+    anom_dataset = build_dataset(**dataset_config)
+    dataset_config.update(anom_only=False, normal_only=True)
+    normal_dataset = build_dataset(**dataset_config)
+
+    train_sampler = torch.utils.data.distributed.DistributedSampler(
+        train_dataset, num_replicas=world_size, rank=rank
+    )
+    anom_samplers = [
+        DistributedEvalSampler(dataset, world_size, rank)
+        for dataset in anom_dataset.datasets
+    ]
+    normal_samplers = [
+        DistributedEvalSampler(dataset, world_size, rank)
+        for dataset in normal_dataset.datasets
+    ]
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset,
+        sampler=train_sampler,
+        batch_size=batch_size,
+        pin_memory=True,
+        num_workers=4,
+        persistent_workers=True,
+        drop_last=True,
+    )
+    eval_batch_size = max(1, batch_size // world_size)
+    anom_loaders = [
+        torch.utils.data.DataLoader(
+            dataset,
+            sampler=sampler,
+            batch_size=eval_batch_size,
+            pin_memory=True,
+            num_workers=2,
+        )
+        for dataset, sampler in zip(anom_dataset.datasets, anom_samplers)
+    ]
+    normal_loaders = [
+        torch.utils.data.DataLoader(
+            dataset,
+            sampler=sampler,
+            batch_size=eval_batch_size,
+            pin_memory=True,
+            num_workers=2,
+        )
+        for dataset, sampler in zip(normal_dataset.datasets, normal_samplers)
+    ]
+
+    diff_in_sh = get_backbone_feature_shape(
+        model_type=config["backbone"]["model_type"]
+    )
+    logger.info("Using input shape %s for the diffusion model", diff_in_sh)
+    model: Denoiser = get_denoiser(**config["diffusion"], input_shape=diff_in_sh)
+    model_ema = copy.deepcopy(model)
+    model.to(device)
+    model_ema.to(device)
+
+    if init_weights is not None:
+        load_initial_weights(init_weights, model=model, model_ema=model_ema)
+        if rank == 0:
+            logger.info("Initialized model weights from %s", init_weights)
+
+    model = torch.nn.parallel.DistributedDataParallel(model, static_graph=True)
+    model_ema = torch.nn.parallel.DistributedDataParallel(
+        model_ema, static_graph=True
+    )
+    for parameter in model_ema.parameters():
+        parameter.requires_grad = False
+
+    backbone_kwargs = config["backbone"]
+    logger.info(
+        "Using feature space reconstruction with %s backbone",
+        backbone_kwargs["model_type"],
+    )
+    feature_extractor = get_backbone(**backbone_kwargs)
+    feature_extractor.to(device).eval()
+    optimizer = get_optimizer([model], **config["optimizer"])
+    scheduler = None
+    if config["optimizer"]["scheduler_type"] != "none":
+        scheduler = get_lr_scheduler(
+            optimizer,
+            **config["optimizer"],
+            iter_per_epoch=len(train_loader),
+        )
+
+    start_epoch = 0
+    global_step = 0
+    best_metric = None
+    if resume is not None:
+        progress = load_training_checkpoint(
+            resume,
+            model=model,
+            model_ema=model_ema,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            config=config,
+            rank=rank,
+            world_size=world_size,
+        )
+        start_epoch = progress["next_epoch"]
+        global_step = progress["global_step"]
+        best_metric = progress["best_metric"]
+        if rank == 0:
+            logger.info(
+                "Resumed %s after epoch %s at global step %s",
+                resume,
+                progress["completed_epoch"],
+                global_step,
+            )
+    dist.barrier()
+
+    num_epochs = config["optimizer"]["num_epochs"]
+    if start_epoch > num_epochs:
+        raise ValueError(
+            f"Checkpoint next_epoch={start_epoch} exceeds num_epochs={num_epochs}"
+        )
+
+    save_dir = Path(config["logging"]["save_dir"])
+    checkpoint_path = save_dir / "training_latest.pth"
+    if rank == 0:
+        save_dir.mkdir(parents=True, exist_ok=True)
+        with open(save_dir / "config.yaml", "w", encoding="utf-8") as file:
+            yaml.dump(config, file)
+        logger.info("Config is saved at %s", save_dir / "config.yaml")
+    dist.barrier()
+
+    model.train()
+    logger.info("Steps per epoch: %s", len(train_loader))
+    ema_decay = config["diffusion"]["ema_decay"]
+    for epoch in range(start_epoch, num_epochs):
+        train_sampler.set_epoch(epoch)
+        for iteration, data in enumerate(train_loader):
+            started_at = time.time()
+            images = data["samples"].to(device)
+            labels = data["clslabels"].to(device)
+            loaded_at = time.time()
+
+            with torch.no_grad():
+                features, _ = feature_extractor(images)
+            forwarded_at = time.time()
+
+            loss = model(features, labels)
+            optimizer.zero_grad()
+            loss.backward()
+            if config["optimizer"]["grad_clip"]:
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), config["optimizer"]["grad_clip"]
+                )
+            optimizer.step()
+            optimized_at = time.time()
+            if scheduler is not None:
+                scheduler.step()
+
+            with torch.no_grad():
+                for ema_parameter, model_parameter in zip(
+                    model_ema.parameters(), model.parameters()
+                ):
+                    ema_parameter.mul_(ema_decay).add_(
+                        model_parameter, alpha=1.0 - ema_decay
+                    )
+            ema_updated_at = time.time()
+
+            global_step += 1
+            if iteration % config["logging"]["log_interval"] == 0 and rank == 0:
+                learning_rate = optimizer.param_groups[0]["lr"]
+                logger.info(
+                    "Epoch %s, Iter %s, Loss %.4f, LR %.6f",
+                    epoch,
+                    iteration,
+                    loss.item(),
+                    learning_rate,
+                )
+                if use_wandb:
+                    wandb.log(
+                        {
+                            "Loss": loss.item(),
+                            "LR": learning_rate,
+                            "Time/Data [ms]": (loaded_at - started_at) * 1000,
+                            "Time/Forward [ms]": (forwarded_at - loaded_at) * 1000,
+                            "Time/Backward [ms]": (optimized_at - forwarded_at) * 1000,
+                            "Time/Total [ms]": (ema_updated_at - started_at) * 1000,
+                        }
+                    )
+
+        if (epoch + 1) % config["logging"]["save_interval"] == 0 and rank == 0:
+            atomic_torch_save(
+                model.state_dict(), save_dir / f"model_latest_{epoch}.pth"
+            )
+            atomic_torch_save(
+                model_ema.state_dict(), save_dir / "model_ema_latest.pth"
+            )
+            logger.info("Model is saved at %s", save_dir)
+
+        _save_distributed_checkpoint(
+            checkpoint_path,
+            model=model,
+            model_ema=model_ema,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            completed_epoch=epoch,
+            global_step=global_step,
+            best_metric=best_metric,
+            config=config,
+            world_size=world_size,
+            rank=rank,
+        )
+
+        if (epoch + 1) % config["evaluation"]["eval_interval"] == 0:
+            all_results = {}
+            categories = [dataset.category for dataset in anom_dataset.datasets]
+            for anom_loader, normal_loader in zip(anom_loaders, normal_loaders):
+                logger.info("Evaluating on %s dataset", anom_loader.dataset.category)
+                metrics_dict = evaluate.evaluate_dist(
+                    model,
+                    feature_extractor,
+                    anom_loader,
+                    normal_loader,
+                    config,
+                    diff_in_sh,
+                    epoch + 1,
+                    config["evaluation"]["eval_step"],
+                    device,
+                    world_size=world_size,
+                    rank=rank,
+                )
+                if rank == 0:
+                    all_results.update(metrics_dict)
+                evaluate.distributed_barrier()
+
+            if rank == 0:
+                avg_results = {}
+                keys = [
+                    "I-AUROC",
+                    "I-AP",
+                    "I-F1Max",
+                    "P-AUROC",
+                    "P-AP",
+                    "P-F1Max",
+                    "PRO",
+                    "mAD",
+                ]
+                for key in keys:
+                    avg_results[key] = np.mean(
+                        [all_results[category][key] for category in all_results]
+                    )
+                logger.info("Average results: %s", avg_results)
+                current_auc = avg_results["I-AUROC"]
+
+                current_metric = float(avg_results["mAD"])
+                if best_metric is None or current_metric > best_metric:
+                    best_metric = current_metric
+                if use_wandb:
+                    for category in categories:
+                        wandb.log({
+                            f"{category}/I-AUROC": all_results[category]["I-AUROC"],
+                            f"{category}/I-AP": all_results[category]["I-AP"],
+                            f"{category}/I-F1Max": all_results[category]["I-F1Max"],
+                            f"{category}/P-AUROC": all_results[category]["P-AUROC"],
+                            f"{category}/P-AP": all_results[category]["P-AP"],
+                            f"{category}/P-F1Max": all_results[category]["P-F1Max"],
+                            f"{category}/PRO": all_results[category]["PRO"],
+                            f"{category}/mAD": all_results[category]["mAD"],
+                        })
+
+                    wandb.log({
+                        "I-AUROC": current_auc,
+                        "I-AP": avg_results["I-AP"],
+                        "I-F1Max": avg_results["I-F1Max"],
+                        "P-AUROC": avg_results["P-AUROC"],
+                        "P-AP": avg_results["P-AP"],
+                        "P-F1Max": avg_results["P-F1Max"],
+                        "PRO": avg_results["PRO"],
+                        "mAD": avg_results["mAD"],
+                    })
+                logger.info("AUC: %s at epoch %s", current_auc, epoch)
+
+            evaluate.distributed_barrier()
+            best_metric_container = [best_metric]
+            dist.broadcast_object_list(best_metric_container, src=0)
+            best_metric = best_metric_container[0]
+            _save_distributed_checkpoint(
+                checkpoint_path,
+                model=model,
+                model_ema=model_ema,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                completed_epoch=epoch,
+                global_step=global_step,
+                best_metric=best_metric,
+                config=config,
+                world_size=world_size,
+                rank=rank,
+            )
+
+    logger.info("Training is done!")
+    if rank == 0:
+        atomic_torch_save(model.state_dict(), save_dir / "model_latest.pth")
+        atomic_torch_save(
+            model_ema.state_dict(), save_dir / "model_ema_latest.pth"
+        )
+        logger.info("Model is saved at %s", save_dir)
+    dist.barrier()
