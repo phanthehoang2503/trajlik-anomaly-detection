@@ -3,11 +3,18 @@ import sys
 import unittest
 from pathlib import Path
 
+import torch
+
 baseline_root = str(Path(__file__).resolve().parents[2] / "baseline" / "InversionAD")
 if baseline_root not in sys.path:
     sys.path.insert(0, baseline_root)
 
-from scripts.evaluate_trajlik import config_fingerprint, validate_runtime_contract
+from scripts.evaluate_trajlik import (
+    config_fingerprint,
+    evaluate_loader,
+    resolve_evaluation_autocast,
+    validate_runtime_contract,
+)
 from trajlik.cache_identity import checkpoint_identity
 
 
@@ -52,6 +59,7 @@ class EvaluateTrajLikTest(unittest.TestCase):
                 "backbone": "efficientnet-b4",
                 "transform_type": "imagenet",
                 "img_size": 256,
+                "autocast_dtype": "none",
             }
         }
 
@@ -76,6 +84,7 @@ class EvaluateTrajLikTest(unittest.TestCase):
                 self._head_checkpoint(config, checkpoint),
                 feature_channels=272,
                 runtime_timestep_map=[0, 1, 2],
+                runtime_autocast_dtype="none",
             )
 
     def test_official_config_and_relocated_dataset_are_accepted(self):
@@ -108,6 +117,7 @@ class EvaluateTrajLikTest(unittest.TestCase):
                     head_checkpoint,
                     feature_channels=272,
                     runtime_timestep_map=[0, 1, 2],
+                    runtime_autocast_dtype="none",
                 )
 
     def test_projected_cache_and_config_mismatch_are_rejected(self):
@@ -136,6 +146,7 @@ class EvaluateTrajLikTest(unittest.TestCase):
                     head_checkpoint,
                     feature_channels=272,
                     runtime_timestep_map=[0, 1, 2],
+                    runtime_autocast_dtype="none",
                 )
             self.assertIn("diffusion.depth", str(context.exception))
 
@@ -163,6 +174,7 @@ class EvaluateTrajLikTest(unittest.TestCase):
                     head_checkpoint,
                     feature_channels=272,
                     runtime_timestep_map=[0, 1, 2],
+                    runtime_autocast_dtype="none",
                 )
 
     def test_timestep_map_mismatch_is_rejected(self):
@@ -187,6 +199,7 @@ class EvaluateTrajLikTest(unittest.TestCase):
                     self._head_checkpoint(config, checkpoint),
                     feature_channels=272,
                     runtime_timestep_map=[0, 2, 3],
+                    runtime_autocast_dtype="none",
                 )
 
     def test_missing_cache_identity_is_rejected(self):
@@ -214,7 +227,94 @@ class EvaluateTrajLikTest(unittest.TestCase):
                     head_checkpoint,
                     feature_channels=272,
                     runtime_timestep_map=[0, 1, 2],
+                    runtime_autocast_dtype="none",
                 )
+
+    def test_cache_autocast_is_used_and_mismatch_is_rejected(self):
+        metadata = {"autocast_dtype": "none"}
+        enabled, dtype, name = resolve_evaluation_autocast(
+            "cpu",
+            "cache",
+            metadata,
+        )
+        self.assertFalse(enabled)
+        self.assertEqual(dtype, torch.float32)
+        self.assertEqual(name, "none")
+
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            resolve_evaluation_autocast("cpu", "float16", metadata)
+
+    def test_evaluate_loader_exports_all_score_branches(self):
+        class FakeModel:
+            def __call__(self, images, labels, lambda_path=1.0):
+                batch_size = images.shape[0]
+                endpoint_tail = torch.tensor(
+                    [[[0.0, 1.0], [2.0, 3.0]]],
+                ).repeat(batch_size, 1, 1)
+                path_tail = torch.tensor(
+                    [[[3.0, 2.0], [1.0, 0.0]]],
+                ).repeat(batch_size, 1, 1)
+                coarse_map = endpoint_tail + lambda_path * path_tail
+                return {
+                    "endpoint_tail": endpoint_tail,
+                    "path_tail": path_tail,
+                    "image_score": (
+                        coarse_map.amax(dim=(-2, -1))
+                        - coarse_map.amin(dim=(-2, -1))
+                    ),
+                    "pixel_map": torch.nn.functional.interpolate(
+                        coarse_map.unsqueeze(1),
+                        size=images.shape[-2:],
+                        mode="bilinear",
+                        align_corners=False,
+                    ).squeeze(1),
+                    "a_end": torch.ones(
+                        batch_size,
+                        *images.shape[-2:],
+                    ),
+                    "a_end_coarse": torch.tensor(
+                        [[[0.0, 1.0], [2.0, 3.0]]],
+                    ).repeat(batch_size, 1, 1),
+                    "final_latent": torch.arange(
+                        batch_size * 4.0,
+                    ).reshape(batch_size, 1, 2, 2),
+                }
+
+        loader = [
+            {
+                "samples": torch.zeros(2, 3, 8, 8),
+                "clslabels": torch.zeros(2, dtype=torch.long),
+                "labels": torch.tensor([0, 1]),
+                "masks": torch.zeros(2, 1, 8, 8),
+            }
+        ]
+        predictions = evaluate_loader(
+            FakeModel(),
+            loader,
+            torch.device("cpu"),
+            lambda_path=0.5,
+        )
+
+        self.assertEqual(
+            set(predictions["branches"]),
+            {
+                "invad_formula_control",
+                "endpoint_only",
+                "path_only",
+                "fused",
+            },
+        )
+        for scores in predictions["branches"].values():
+            self.assertEqual(scores["image_scores"].shape, (2,))
+            self.assertEqual(scores["pixel_maps"].shape, (2, 8, 8))
+        torch.testing.assert_close(
+            torch.from_numpy(
+                predictions["branches"]["invad_formula_control"][
+                    "image_scores"
+                ]
+            ),
+            torch.tensor([0.0, 1.0]),
+        )
 
 if __name__ == "__main__":
     unittest.main()
